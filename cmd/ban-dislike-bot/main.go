@@ -14,33 +14,37 @@ import (
 )
 
 func main() {
-	cfg, err := config.Load()
-	if err != nil {
-		slog.Error("invalid configuration", "error", err)
+	cfg, configErr := config.Load()
+	if configErr != nil {
+		slog.Error("invalid configuration", "error", configErr)
 		os.Exit(1)
 	}
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel}))
 	slog.SetDefault(logger)
 
 	if dir := filepath.Dir(cfg.DBPath); dir != "." {
-		if err := os.MkdirAll(dir, 0o750); err != nil {
-			logger.Error("create database directory", "error", err)
+		if mkdirErr := os.MkdirAll(dir, 0o750); mkdirErr != nil {
+			logger.Error("create database directory", "error", mkdirErr)
 			os.Exit(1)
 		}
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	store, err := storage.Open(ctx, cfg.DBPath)
-	if err != nil {
-		logger.Error("open storage", "error", err)
+	store, storeErr := storage.Open(ctx, cfg.DBPath)
+	if storeErr != nil {
+		logger.Error("open storage", "error", storeErr)
 		os.Exit(1)
 	}
-	defer store.Close()
+	defer func() {
+		if closeErr := store.Close(); closeErr != nil {
+			logger.Error("close storage", "error", closeErr)
+		}
+	}()
 
-	app, err := telegramapp.New(cfg.Token, store, logger)
-	if err != nil {
-		logger.Error("initialize telegram bot", "error", err)
+	app, appErr := telegramapp.New(cfg.Token, store, logger)
+	if appErr != nil {
+		logger.Error("initialize telegram bot", "error", appErr)
 		os.Exit(1)
 	}
 	logger.Info("bot started", "db_path", cfg.DBPath)

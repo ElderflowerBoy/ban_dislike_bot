@@ -35,7 +35,7 @@ func TestConcurrentThresholdCrossingQueuesSingleJob(t *testing.T) {
 
 	var wg sync.WaitGroup
 	errs := make(chan error, 10)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		wg.Add(1)
 		go func(updateID int64) {
 			defer wg.Done()
@@ -66,18 +66,18 @@ func TestApplyReactionQueuesOnceAndDeduplicatesUpdates(t *testing.T) {
 	if err := store.TrackMessage(ctx, message); err != nil {
 		t.Fatal(err)
 	}
-	settings, err := store.Settings(ctx, message.ChatID)
-	if err != nil {
-		t.Fatal(err)
+	settings, settingsErr := store.Settings(ctx, message.ChatID)
+	if settingsErr != nil {
+		t.Fatal(settingsErr)
 	}
 	if settings.Enabled || settings.Threshold != core.DefaultThreshold {
 		t.Fatalf("unexpected defaults: %+v", settings)
 	}
-	if err := store.SetThreshold(ctx, message.ChatID, 3); err != nil {
-		t.Fatal(err)
+	if thresholdErr := store.SetThreshold(ctx, message.ChatID, 3); thresholdErr != nil {
+		t.Fatal(thresholdErr)
 	}
-	if err := store.SetEnabled(ctx, message.ChatID, true); err != nil {
-		t.Fatal(err)
+	if enableErr := store.SetEnabled(ctx, message.ChatID, true); enableErr != nil {
+		t.Fatal(enableErr)
 	}
 
 	first, err := store.ApplyReaction(ctx, core.ReactionChange{UpdateID: 1, ChatID: message.ChatID, MessageID: message.MessageID, Delta: 1})
@@ -122,15 +122,15 @@ func TestApplyReactionQueuesOnceAndDeduplicatesUpdates(t *testing.T) {
 func TestApplyReactionIgnoresUnknownAndClampsAtZero(t *testing.T) {
 	ctx := context.Background()
 	store := openTestStore(t)
-	unknown, err := store.ApplyReaction(ctx, core.ReactionChange{UpdateID: 10, ChatID: -1, MessageID: 1, Delta: 1})
-	if err != nil {
-		t.Fatal(err)
+	unknown, applyErr := store.ApplyReaction(ctx, core.ReactionChange{UpdateID: 10, ChatID: -1, MessageID: 1, Delta: 1})
+	if applyErr != nil {
+		t.Fatal(applyErr)
 	}
 	if unknown.Known {
 		t.Fatal("unknown message was treated as tracked")
 	}
-	if err := store.TrackMessage(ctx, core.TrackedMessage{ChatID: -1, MessageID: 2, AuthorID: 3, AuthorName: "user"}); err != nil {
-		t.Fatal(err)
+	if trackErr := store.TrackMessage(ctx, core.TrackedMessage{ChatID: -1, MessageID: 2, AuthorID: 3, AuthorName: "user"}); trackErr != nil {
+		t.Fatal(trackErr)
 	}
 	result, err := store.ApplyReaction(ctx, core.ReactionChange{UpdateID: 11, ChatID: -1, MessageID: 2, Delta: -1})
 	if err != nil {
@@ -144,27 +144,27 @@ func TestApplyReactionIgnoresUnknownAndClampsAtZero(t *testing.T) {
 func TestSettingsPersistAfterReopen(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "persistent.db")
-	store, err := Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
+	store, openErr := Open(ctx, path)
+	if openErr != nil {
+		t.Fatal(openErr)
 	}
-	if err := store.SetThreshold(ctx, -99, 27); err != nil {
-		t.Fatal(err)
+	if thresholdErr := store.SetThreshold(ctx, -99, 27); thresholdErr != nil {
+		t.Fatal(thresholdErr)
 	}
-	if err := store.SetEnabled(ctx, -99, true); err != nil {
-		t.Fatal(err)
+	if enableErr := store.SetEnabled(ctx, -99, true); enableErr != nil {
+		t.Fatal(enableErr)
 	}
-	if err := store.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := store.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
-	store, err = Open(ctx, path)
-	if err != nil {
-		t.Fatal(err)
+	store, openErr = Open(ctx, path)
+	if openErr != nil {
+		t.Fatal(openErr)
 	}
-	defer store.Close()
-	settings, err := store.Settings(ctx, -99)
-	if err != nil {
-		t.Fatal(err)
+	defer func() { _ = store.Close() }()
+	settings, settingsErr := store.Settings(ctx, -99)
+	if settingsErr != nil {
+		t.Fatal(settingsErr)
 	}
 	if !settings.Enabled || settings.Threshold != 27 {
 		t.Fatalf("settings did not persist: %+v", settings)

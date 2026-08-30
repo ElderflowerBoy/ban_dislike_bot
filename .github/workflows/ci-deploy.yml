@@ -1,0 +1,137 @@
+name: CI and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Test, lint, and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Verify dependencies
+        run: go mod verify
+
+      - name: Check formatting
+        run: make fmt-check
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.0
+
+      - name: Test with race detector
+        run: go test -race ./...
+
+      - name: Build
+        run: go build ./cmd/ban-dislike-bot
+
+  deploy:
+    name: Deploy to production VPS
+    needs: quality
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    concurrency:
+      group: production-vps
+      cancel-in-progress: false
+    env:
+      APP_DIR: /opt/ban-dislike-bot
+      APP_NAME: ban-dislike-bot
+      DEPLOY_KEY: ${{ secrets.VPS_SSH_KEY }}
+      VPS_HOST: ${{ secrets.VPS_HOST }}
+      VPS_HOST_KEY: ${{ secrets.VPS_HOST_KEY }}
+      VPS_USER: ${{ secrets.VPS_USER }}
+      TARGET_GOARCH: ${{ vars.VPS_GOARCH || 'amd64' }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build Linux binary
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ env.TARGET_GOARCH }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w" -o dist/ban-dislike-bot ./cmd/ban-dislike-bot
+          cd dist
+          sha256sum ban-dislike-bot > ban-dislike-bot.sha256
+
+      - name: Configure SSH
+        run: |
+          install -m 700 -d "$RUNNER_TEMP/deploy-ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$RUNNER_TEMP/deploy-ssh/id_ed25519"
+          chmod 600 "$RUNNER_TEMP/deploy-ssh/id_ed25519"
+          printf '%s\n' "$VPS_HOST_KEY" > "$RUNNER_TEMP/deploy-ssh/known_hosts"
+          chmod 600 "$RUNNER_TEMP/deploy-ssh/known_hosts"
+
+      - name: Upload release
+        run: |
+          ssh_opts=(
+            -i "$RUNNER_TEMP/deploy-ssh/id_ed25519"
+            -o UserKnownHostsFile="$RUNNER_TEMP/deploy-ssh/known_hosts"
+            -o StrictHostKeyChecking=yes
+          )
+          ssh "${ssh_opts[@]}" "$VPS_USER@$VPS_HOST" "mkdir -p '$APP_DIR'"
+          scp "${ssh_opts[@]}" dist/ban-dislike-bot "$VPS_USER@$VPS_HOST:$APP_DIR/$APP_NAME.new"
+          scp "${ssh_opts[@]}" dist/ban-dislike-bot.sha256 "$VPS_USER@$VPS_HOST:$APP_DIR/$APP_NAME.new.sha256"
+
+      - name: Activate release
+        run: |
+          ssh_opts=(
+            -i "$RUNNER_TEMP/deploy-ssh/id_ed25519"
+            -o UserKnownHostsFile="$RUNNER_TEMP/deploy-ssh/known_hosts"
+            -o StrictHostKeyChecking=yes
+          )
+          ssh "${ssh_opts[@]}" "$VPS_USER@$VPS_HOST" 'bash -s' <<'REMOTE'
+          set -Eeuo pipefail
+          app_dir=/opt/ban-dislike-bot
+          app_name=ban-dislike-bot
+          cd "$app_dir"
+
+          expected_checksum="$(cut -d ' ' -f 1 "$app_name.new.sha256")"
+          printf '%s  %s\n' "$expected_checksum" "$app_name.new" | sha256sum --check --strict
+          chmod 755 "$app_name.new"
+
+          if [ -f "$app_name" ]; then
+            cp -a "$app_name" "$app_name.previous"
+          fi
+          mv -f "$app_name.new" "$app_name"
+          rm -f "$app_name.new.sha256"
+
+          sudo systemctl restart ban-dislike-bot
+          sleep 8
+          if ! systemctl is-active --quiet ban-dislike-bot; then
+            if [ -f "$app_name.previous" ]; then
+              mv -f "$app_name.previous" "$app_name"
+              sudo systemctl restart ban-dislike-bot
+            fi
+            systemctl status ban-dislike-bot --no-pager || true
+            exit 1
+          fi
+          systemctl status ban-dislike-bot --no-pager
+          REMOTE

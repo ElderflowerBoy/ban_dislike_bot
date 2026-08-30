@@ -1,5 +1,8 @@
 /ban-dislike-bot
+/.env
 /.idea/
+/bin/
+/dist/
 /data/
 *.db
 *.db-shm

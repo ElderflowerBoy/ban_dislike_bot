@@ -27,13 +27,13 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		"PRAGMA busy_timeout = 5000",
 	} {
 		if _, err := db.ExecContext(ctx, pragma); err != nil {
-			db.Close()
+			_ = db.Close()
 			return nil, fmt.Errorf("configure sqlite: %w", err)
 		}
 	}
 	s := &Store{db: db}
 	if err := s.migrate(ctx); err != nil {
-		db.Close()
+		_ = db.Close()
 		return nil, err
 	}
 	return s, nil
@@ -91,17 +91,17 @@ CREATE INDEX IF NOT EXISTS idx_jobs_due ON moderation_jobs(state, next_attempt_a
 
 func (s *Store) TrackMessage(ctx context.Context, message core.TrackedMessage) error {
 	now := time.Now().Unix()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	tx, beginErr := s.db.BeginTx(ctx, nil)
+	if beginErr != nil {
+		return beginErr
 	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO chat_settings(chat_id, enabled, threshold, updated_at) VALUES (?, 0, ?, ?)`, message.ChatID, core.DefaultThreshold, now); err != nil {
-		return fmt.Errorf("ensure chat settings: %w", err)
+	defer func() { _ = tx.Rollback() }()
+	if _, execErr := tx.ExecContext(ctx, `INSERT OR IGNORE INTO chat_settings(chat_id, enabled, threshold, updated_at) VALUES (?, 0, ?, ?)`, message.ChatID, core.DefaultThreshold, now); execErr != nil {
+		return fmt.Errorf("ensure chat settings: %w", execErr)
 	}
-	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO tracked_messages(chat_id, message_id, author_id, author_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, message.ChatID, message.MessageID, message.AuthorID, message.AuthorName, now, now)
-	if err != nil {
-		return fmt.Errorf("track message: %w", err)
+	_, execErr := tx.ExecContext(ctx, `INSERT OR IGNORE INTO tracked_messages(chat_id, message_id, author_id, author_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`, message.ChatID, message.MessageID, message.AuthorID, message.AuthorName, now, now)
+	if execErr != nil {
+		return fmt.Errorf("track message: %w", execErr)
 	}
 	return tx.Commit()
 }
@@ -138,16 +138,16 @@ func (s *Store) SetThreshold(ctx context.Context, chatID int64, threshold int) e
 }
 
 func (s *Store) ApplyReaction(ctx context.Context, change core.ReactionChange) (core.ApplyResult, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return core.ApplyResult{}, err
+	tx, beginErr := s.db.BeginTx(ctx, nil)
+	if beginErr != nil {
+		return core.ApplyResult{}, beginErr
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	now := time.Now().Unix()
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO processed_updates(update_id, processed_at) VALUES (?, ?)`, change.UpdateID, now)
-	if err != nil {
-		return core.ApplyResult{}, fmt.Errorf("record update: %w", err)
+	result, execErr := tx.ExecContext(ctx, `INSERT OR IGNORE INTO processed_updates(update_id, processed_at) VALUES (?, ?)`, change.UpdateID, now)
+	if execErr != nil {
+		return core.ApplyResult{}, fmt.Errorf("record update: %w", execErr)
 	}
 	inserted, _ := result.RowsAffected()
 	if inserted == 0 {
@@ -155,12 +155,12 @@ func (s *Store) ApplyReaction(ctx context.Context, change core.ReactionChange) (
 	}
 
 	var message core.TrackedMessage
-	err = tx.QueryRowContext(ctx, `SELECT author_id, author_name, dislike_count, status FROM tracked_messages WHERE chat_id=? AND message_id=?`, change.ChatID, change.MessageID).Scan(&message.AuthorID, &message.AuthorName, &message.DislikeCount, &message.Status)
-	if errors.Is(err, sql.ErrNoRows) {
+	queryErr := tx.QueryRowContext(ctx, `SELECT author_id, author_name, dislike_count, status FROM tracked_messages WHERE chat_id=? AND message_id=?`, change.ChatID, change.MessageID).Scan(&message.AuthorID, &message.AuthorName, &message.DislikeCount, &message.Status)
+	if errors.Is(queryErr, sql.ErrNoRows) {
 		return core.ApplyResult{}, tx.Commit()
 	}
-	if err != nil {
-		return core.ApplyResult{}, fmt.Errorf("read tracked message: %w", err)
+	if queryErr != nil {
+		return core.ApplyResult{}, fmt.Errorf("read tracked message: %w", queryErr)
 	}
 	message.ChatID, message.MessageID = change.ChatID, change.MessageID
 	count := message.DislikeCount + change.Delta
@@ -170,27 +170,27 @@ func (s *Store) ApplyReaction(ctx context.Context, change core.ReactionChange) (
 	if count < 0 {
 		count = 0
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE tracked_messages SET dislike_count=?, updated_at=? WHERE chat_id=? AND message_id=?`, count, now, change.ChatID, change.MessageID); err != nil {
-		return core.ApplyResult{}, fmt.Errorf("update dislike count: %w", err)
+	if _, updateErr := tx.ExecContext(ctx, `UPDATE tracked_messages SET dislike_count=?, updated_at=? WHERE chat_id=? AND message_id=?`, count, now, change.ChatID, change.MessageID); updateErr != nil {
+		return core.ApplyResult{}, fmt.Errorf("update dislike count: %w", updateErr)
 	}
 
 	var enabled int
 	threshold := core.DefaultThreshold
-	err = tx.QueryRowContext(ctx, `SELECT enabled, threshold FROM chat_settings WHERE chat_id=?`, change.ChatID).Scan(&enabled, &threshold)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return core.ApplyResult{}, fmt.Errorf("read settings: %w", err)
+	settingsErr := tx.QueryRowContext(ctx, `SELECT enabled, threshold FROM chat_settings WHERE chat_id=?`, change.ChatID).Scan(&enabled, &threshold)
+	if settingsErr != nil && !errors.Is(settingsErr, sql.ErrNoRows) {
+		return core.ApplyResult{}, fmt.Errorf("read settings: %w", settingsErr)
 	}
 	queued := false
 	if enabled != 0 && count >= threshold && message.Status == "tracking" {
-		res, err := tx.ExecContext(ctx, `UPDATE tracked_messages SET status='pending', updated_at=? WHERE chat_id=? AND message_id=? AND status='tracking'`, now, change.ChatID, change.MessageID)
-		if err != nil {
-			return core.ApplyResult{}, fmt.Errorf("reserve moderation: %w", err)
+		res, reserveErr := tx.ExecContext(ctx, `UPDATE tracked_messages SET status='pending', updated_at=? WHERE chat_id=? AND message_id=? AND status='tracking'`, now, change.ChatID, change.MessageID)
+		if reserveErr != nil {
+			return core.ApplyResult{}, fmt.Errorf("reserve moderation: %w", reserveErr)
 		}
 		changed, _ := res.RowsAffected()
 		if changed == 1 {
-			_, err = tx.ExecContext(ctx, `INSERT INTO moderation_jobs(chat_id, message_id, author_id, author_name, dislikes, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, change.ChatID, change.MessageID, message.AuthorID, message.AuthorName, count, now, now, now)
-			if err != nil {
-				return core.ApplyResult{}, fmt.Errorf("queue moderation: %w", err)
+			_, queueErr := tx.ExecContext(ctx, `INSERT INTO moderation_jobs(chat_id, message_id, author_id, author_name, dislikes, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, change.ChatID, change.MessageID, message.AuthorID, message.AuthorName, count, now, now, now)
+			if queueErr != nil {
+				return core.ApplyResult{}, fmt.Errorf("queue moderation: %w", queueErr)
 			}
 			queued = true
 		}
@@ -206,7 +206,7 @@ func (s *Store) DueJobs(ctx context.Context, limit int) ([]core.ModerationJob, e
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var jobs []core.ModerationJob
 	for rows.Next() {
 		var job core.ModerationJob
@@ -236,11 +236,11 @@ func (s *Store) FinishJob(ctx context.Context, chatID int64, messageID int, stat
 	if state != "completed" && state != "exempt" && state != "failed" {
 		return fmt.Errorf("invalid final state %q", state)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	tx, beginErr := s.db.BeginTx(ctx, nil)
+	if beginErr != nil {
+		return beginErr
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx, `UPDATE moderation_jobs SET state=?, updated_at=? WHERE chat_id=? AND message_id=?`, state, time.Now().Unix(), chatID, messageID); err != nil {
 		return err
 	}

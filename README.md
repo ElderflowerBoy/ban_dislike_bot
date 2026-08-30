@@ -58,8 +58,22 @@ TELEGRAM_BOT_TOKEN=123456:secret ./ban-dislike-bot
 ## Разработка
 
 ```bash
-go test ./...
-go vet ./...
+make verify
+make test-race
+make lint
 ```
 
 Тесты покрывают дедупликацию Telegram-обновлений, подсчёт публичных и анонимных реакций, единственную постановку наказания в очередь, сохранение SQLite, защиту администратора и повторные попытки при ошибках Telegram.
+
+При первом `make lint` автоматически устанавливается закреплённая версия `golangci-lint` в локальный каталог `bin/`. Linux-бинарник для VPS собирается командой:
+
+```bash
+make build-linux            # amd64
+make build-linux GOARCH=arm64
+```
+
+## CI/CD и VPS
+
+Workflow `.github/workflows/ci-deploy.yml` проверяет каждый pull request и push в `main`. После успешных проверок push в `main` разворачивается в GitHub Environment `production` на VPS через SSH.
+
+Первоначальная настройка systemd, секретов GitHub, SSH host key и каталогов описана в [deploy/README.md](deploy/README.md). Telegram-токен и файл SQLite остаются только на VPS и не передаются при каждом деплое.
