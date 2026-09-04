@@ -2,6 +2,7 @@ package spam
 
 import (
 	"math"
+	"slices"
 	"testing"
 )
 
@@ -92,12 +93,7 @@ func TestLearnedWordsBecomeConservativeSignal(t *testing.T) {
 }
 
 func containsSignal(signals []string, expected string) bool {
-	for _, signal := range signals {
-		if signal == expected {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(signals, expected)
 }
 
 func TestNormalize(t *testing.T) {

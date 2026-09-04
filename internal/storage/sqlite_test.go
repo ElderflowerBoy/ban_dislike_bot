@@ -25,7 +25,7 @@ func trustParticipant(t *testing.T, store *Store, chatID, userID int64) {
 	if err := store.RecordMember(context.Background(), core.MemberChange{ChatID: chatID, UserID: userID, JoinedAt: time.Now().Add(-4 * 24 * time.Hour), Active: true}); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < core.MinTrustedMessages; i++ {
+	for i := range core.MinTrustedMessages {
 		if err := store.TrackMessage(context.Background(), core.TrackedMessage{ChatID: chatID, MessageID: int(userID*10) + i, AuthorID: userID, AuthorName: "voter"}); err != nil {
 			t.Fatal(err)
 		}
