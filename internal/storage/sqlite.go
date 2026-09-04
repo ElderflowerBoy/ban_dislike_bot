@@ -134,7 +134,10 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 	if err := s.ensureColumn(ctx, "message_votes", "source", "TEXT NOT NULL DEFAULT 'human'"); err != nil {
 		return err
 	}
-	return s.migrateTrustedVotes(ctx)
+	if err := s.migrateTrustedVotes(ctx); err != nil {
+		return err
+	}
+	return s.migrateUnfilteredVotes(ctx)
 }
 
 func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
@@ -195,6 +198,31 @@ func (s *Store) migrateTrustedVotes(ctx context.Context) error {
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE tracked_messages SET dislike_count=0, updated_at=? WHERE status='tracking'`, now); err != nil {
 		return fmt.Errorf("reset legacy dislike counts: %w", err)
+	}
+	return tx.Commit()
+}
+
+func (s *Store) migrateUnfilteredVotes(ctx context.Context) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	now := time.Now().Unix()
+	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO schema_migrations(name, applied_at) VALUES ('unfiltered_votes_v1', ?)`, now)
+	if err != nil {
+		return fmt.Errorf("record unfiltered vote migration: %w", err)
+	}
+	inserted, _ := result.RowsAffected()
+	if inserted == 0 {
+		return tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE message_votes SET counted=CASE WHEN EXISTS (SELECT 1 FROM tracked_messages m WHERE m.chat_id=message_votes.chat_id AND m.message_id=message_votes.message_id AND m.author_id<>message_votes.voter_id) THEN 1 ELSE 0 END, updated_at=?`, now); err != nil {
+		return fmt.Errorf("enable existing votes: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE tracked_messages SET dislike_count=(SELECT COUNT(*) FROM message_votes v WHERE v.chat_id=tracked_messages.chat_id AND v.message_id=tracked_messages.message_id AND v.counted=1), updated_at=? WHERE status='tracking'`, now); err != nil {
+		return fmt.Errorf("recount existing votes: %w", err)
 	}
 	return tx.Commit()
 }
@@ -305,15 +333,7 @@ func (s *Store) ApplyReaction(ctx context.Context, change core.ReactionChange) (
 
 	counted := false
 	if change.Delta > 0 {
-		if change.Automated {
-			counted = true
-		} else {
-			trusted, trustErr := trustedVoter(tx, change.ChatID, change.ActorID, message.AuthorID, now)
-			if trustErr != nil {
-				return core.ApplyResult{}, fmt.Errorf("check voter reputation: %w", trustErr)
-			}
-			counted = trusted
-		}
+		counted = change.ActorID != message.AuthorID
 		source := "human"
 		if change.Automated {
 			source = "bot"
@@ -337,14 +357,14 @@ func (s *Store) ApplyReaction(ctx context.Context, change core.ReactionChange) (
 
 	var count int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM message_votes WHERE chat_id=? AND message_id=? AND counted=1`, change.ChatID, change.MessageID).Scan(&count); err != nil {
-		return core.ApplyResult{}, fmt.Errorf("count trusted votes: %w", err)
+		return core.ApplyResult{}, fmt.Errorf("count votes: %w", err)
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE tracked_messages SET dislike_count=?, updated_at=? WHERE chat_id=? AND message_id=?`, count, now, change.ChatID, change.MessageID); err != nil {
 		return core.ApplyResult{}, fmt.Errorf("update dislike count: %w", err)
 	}
 	var humanCount int
 	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM message_votes WHERE chat_id=? AND message_id=? AND counted=1 AND source='human'`, change.ChatID, change.MessageID).Scan(&humanCount); err != nil {
-		return core.ApplyResult{}, fmt.Errorf("count trusted human votes: %w", err)
+		return core.ApplyResult{}, fmt.Errorf("count human votes: %w", err)
 	}
 
 	var enabled int
@@ -353,14 +373,7 @@ func (s *Store) ApplyReaction(ctx context.Context, change core.ReactionChange) (
 	if settingsErr != nil && !errors.Is(settingsErr, sql.ErrNoRows) {
 		return core.ApplyResult{}, fmt.Errorf("read settings: %w", settingsErr)
 	}
-	protected, err := trustedParticipant(tx, change.ChatID, message.AuthorID, now)
-	if err != nil {
-		return core.ApplyResult{}, fmt.Errorf("check author reputation: %w", err)
-	}
 	required := threshold
-	if protected {
-		required *= core.ProtectedAuthorMultiplier
-	}
 	queued := false
 	if enabled != 0 && count >= required && humanCount > 0 && message.Status == "tracking" {
 		res, reserveErr := tx.ExecContext(ctx, `UPDATE tracked_messages SET status='pending', updated_at=? WHERE chat_id=? AND message_id=? AND status='tracking'`, now, change.ChatID, change.MessageID)
@@ -375,7 +388,7 @@ func (s *Store) ApplyReaction(ctx context.Context, change core.ReactionChange) (
 					return core.ApplyResult{}, fmt.Errorf("select notification recipient: %w", err)
 				}
 			}
-			_, queueErr := tx.ExecContext(ctx, `INSERT INTO moderation_jobs(chat_id, message_id, author_id, author_name, notification_user_id, dislikes, protect_author, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, change.ChatID, change.MessageID, message.AuthorID, message.AuthorName, notificationUserID, count, boolInt(protected), now, now, now)
+			_, queueErr := tx.ExecContext(ctx, `INSERT INTO moderation_jobs(chat_id, message_id, author_id, author_name, notification_user_id, dislikes, protect_author, next_attempt_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`, change.ChatID, change.MessageID, message.AuthorID, message.AuthorName, notificationUserID, count, now, now, now)
 			if queueErr != nil {
 				return core.ApplyResult{}, fmt.Errorf("queue moderation: %w", queueErr)
 			}
@@ -386,38 +399,6 @@ func (s *Store) ApplyReaction(ctx context.Context, change core.ReactionChange) (
 		return core.ApplyResult{}, err
 	}
 	return core.ApplyResult{Known: true, Queued: queued, Counted: counted, Count: count, Required: required}, nil
-}
-
-func trustedVoter(tx *sql.Tx, chatID, voterID, authorID int64, now int64) (bool, error) {
-	if voterID == authorID {
-		return false, nil
-	}
-	return trustedParticipant(tx, chatID, voterID, now)
-}
-
-func trustedParticipant(tx *sql.Tx, chatID, userID, now int64) (bool, error) {
-	var firstSeen, joined int64
-	var messages, bot, admin, active int
-	err := tx.QueryRow(`SELECT first_seen_at, joined_at, message_count, is_bot, is_admin, active FROM chat_participants WHERE chat_id=? AND user_id=?`, chatID, userID).Scan(&firstSeen, &joined, &messages, &bot, &admin, &active)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if bot != 0 || active == 0 {
-		return false, nil
-	}
-	if admin != 0 {
-		return true, nil
-	}
-	if messages < core.MinTrustedMessages {
-		return false, nil
-	}
-	if joined > 0 {
-		firstSeen = joined
-	}
-	return firstSeen <= now-int64(core.NewMemberPeriod/time.Second), nil
 }
 
 func boolInt(value bool) int {

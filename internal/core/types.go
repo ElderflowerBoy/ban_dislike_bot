@@ -3,12 +3,9 @@ package core
 import "time"
 
 const (
-	DefaultThreshold          = 10
-	MinThreshold              = 1
-	MaxThreshold              = 1000
-	MinTrustedMessages        = 3
-	ProtectedAuthorMultiplier = 2
-	NewMemberPeriod           = 72 * time.Hour
+	DefaultThreshold = 10
+	MinThreshold     = 1
+	MaxThreshold     = 1000
 )
 
 type Settings struct {

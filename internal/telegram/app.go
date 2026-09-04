@@ -460,9 +460,9 @@ func (a *App) NotifyBanned(ctx context.Context, job core.ModerationJob) error {
 	if job.NotificationUserID == 0 {
 		return nil
 	}
-	text := fmt.Sprintf("Сообщение пользователя %s удалено: оно набрало %d доверенных 👎. Пользователь не заблокирован автоматически.", job.AuthorName, job.Dislikes)
+	text := fmt.Sprintf("Сообщение пользователя %s удалено: оно набрало %d уникальных 👎. Пользователь не заблокирован автоматически.", job.AuthorName, job.Dislikes)
 	if !job.ProtectAuthor {
-		text = fmt.Sprintf("Пользователь %s заблокирован бессрочно: сообщение набрало %d доверенных 👎.", job.AuthorName, job.Dislikes)
+		text = fmt.Sprintf("Пользователь %s заблокирован бессрочно: сообщение набрало %d уникальных 👎.", job.AuthorName, job.Dislikes)
 	}
 	_, err := a.bot.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: job.ChatID,
@@ -475,7 +475,7 @@ func (a *App) NotifyBanned(ctx context.Context, job core.ModerationJob) error {
 }
 
 func (a *App) NotifyFailure(ctx context.Context, job core.ModerationJob, cause error) error {
-	text := fmt.Sprintf("Не удалось автоматически обработать сообщение %s с %d доверенными 👎. Администратору нужно проверить права бота и выполнить модерацию вручную.", job.AuthorName, job.Dislikes)
+	text := fmt.Sprintf("Не удалось автоматически обработать сообщение %s с %d уникальными 👎. Администратору нужно проверить права бота и выполнить модерацию вручную.", job.AuthorName, job.Dislikes)
 	if job.ProtectAuthor {
 		text = fmt.Sprintf("Сообщение активного участника %s набрало %d доверенных 👎, но бот не смог его удалить. Проверьте права бота.", job.AuthorName, job.Dislikes)
 	}
@@ -604,7 +604,7 @@ func rightsProblem(rights core.BotRights) string {
 	return "Автомодерация не включена: нужно " + strings.Join(missing, ", ") + "."
 }
 
-const helpText = `Бот блокирует автора сообщения, когда сообщение набирает заданное количество доверенных 👎. Для активных давних участников порог удваивается, а сообщение удаляется без автоматической блокировки. Каналы с VPN/ВПН/PROXY/ПРОКСИ в названии блокируются автоматически.
+const helpText = `Бот блокирует автора сообщения, когда сообщение набирает заданное количество уникальных персональных 👎. Голоса учитываются сразу, независимо от давности и активности участника. Каналы с VPN/ВПН/PROXY/ПРОКСИ в названии блокируются автоматически.
 
 Команды администратора:
 /status — состояние и текущий порог
