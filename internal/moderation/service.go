@@ -13,6 +13,7 @@ const maxAttempts = 5
 
 type Store interface {
 	ApplyReaction(context.Context, core.ReactionChange) (core.ApplyResult, error)
+	RecordSpamSample(context.Context, core.SpamSample) error
 	DueJobs(context.Context, int) ([]core.ModerationJob, error)
 	MarkStep(context.Context, int64, int, string) error
 	FinishJob(context.Context, int64, int, string) error
@@ -26,6 +27,7 @@ type Telegram interface {
 	DeleteMessage(context.Context, int64, int) error
 	NotifyBanned(context.Context, core.ModerationJob) error
 	NotifyFailure(context.Context, core.ModerationJob, error) error
+	LearnSpam(core.SpamSample) error
 }
 
 type Service struct {
@@ -109,8 +111,10 @@ func (s *Service) processJob(ctx context.Context, job core.ModerationJob) error 
 		if admin {
 			return s.store.FinishJob(ctx, job.ChatID, job.MessageID, "exempt")
 		}
-		if err := s.telegram.Ban(ctx, job.ChatID, job.AuthorID); err != nil {
-			return fmt.Errorf("ban author: %w", err)
+		if !job.ProtectAuthor {
+			if err := s.telegram.Ban(ctx, job.ChatID, job.AuthorID); err != nil {
+				return fmt.Errorf("ban author: %w", err)
+			}
 		}
 		if err := s.store.MarkStep(ctx, job.ChatID, job.MessageID, "ban"); err != nil {
 			return fmt.Errorf("save ban result: %w", err)
@@ -122,6 +126,15 @@ func (s *Service) processJob(ctx context.Context, job core.ModerationJob) error 
 		}
 		if err := s.store.MarkStep(ctx, job.ChatID, job.MessageID, "delete"); err != nil {
 			return fmt.Errorf("save deletion result: %w", err)
+		}
+	}
+	if !job.ProtectAuthor && job.Content != "" {
+		sample := core.SpamSample{ChatID: job.ChatID, MessageID: job.MessageID, Content: job.Content}
+		if err := s.store.RecordSpamSample(ctx, sample); err != nil {
+			return err
+		}
+		if err := s.telegram.LearnSpam(sample); err != nil {
+			return fmt.Errorf("update spam cache: %w", err)
 		}
 	}
 	if !job.NotifyDone {

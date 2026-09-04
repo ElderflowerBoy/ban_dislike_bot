@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/ElderflowerBoy/ban_dislike_bot/internal/config"
+	"github.com/ElderflowerBoy/ban_dislike_bot/internal/spam"
 	"github.com/ElderflowerBoy/ban_dislike_bot/internal/storage"
 	telegramapp "github.com/ElderflowerBoy/ban_dislike_bot/internal/telegram"
 )
@@ -42,12 +43,33 @@ func main() {
 		}
 	}()
 
-	app, appErr := telegramapp.New(cfg.Token, store, logger)
+	var spamDetector telegramapp.SpamDetector
+	if cfg.SpamFilterEnabled {
+		detector, detectorErr := spam.NewDetector(cfg.SpamThreshold)
+		if detectorErr != nil {
+			logger.Error("initialize spam detector", "error", detectorErr)
+			os.Exit(1)
+		}
+		samples, samplesErr := store.SpamSamples(ctx)
+		if samplesErr != nil {
+			logger.Error("load spam samples", "error", samplesErr)
+			os.Exit(1)
+		}
+		for _, sample := range samples {
+			if learnErr := detector.LearnSpam(sample.ChatID, sample.MessageID, sample.Content); learnErr != nil {
+				logger.Error("restore spam sample", "chat_id", sample.ChatID, "message_id", sample.MessageID, "error", learnErr)
+				os.Exit(1)
+			}
+		}
+		spamDetector = detector
+	}
+
+	app, appErr := telegramapp.New(cfg.Token, store, spamDetector, logger)
 	if appErr != nil {
 		logger.Error("initialize telegram bot", "error", appErr)
 		os.Exit(1)
 	}
-	logger.Info("bot started", "db_path", cfg.DBPath)
+	logger.Info("bot started", "db_path", cfg.DBPath, "spam_filter", cfg.SpamFilterEnabled, "spam_threshold", cfg.SpamThreshold)
 	app.Start(ctx)
 	logger.Info("bot stopped")
 }

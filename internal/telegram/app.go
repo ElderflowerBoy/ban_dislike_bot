@@ -7,9 +7,11 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ElderflowerBoy/ban_dislike_bot/internal/core"
 	"github.com/ElderflowerBoy/ban_dislike_bot/internal/moderation"
+	"github.com/ElderflowerBoy/ban_dislike_bot/internal/spam"
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
@@ -19,18 +21,25 @@ type Store interface {
 	Settings(context.Context, int64) (core.Settings, error)
 	SetEnabled(context.Context, int64, bool) error
 	SetThreshold(context.Context, int64, int) error
+	RecordMember(context.Context, core.MemberChange) error
 	moderation.Store
+}
+
+type SpamDetector interface {
+	Detect(string) spam.Result
+	LearnSpam(int64, int, string) error
 }
 
 type App struct {
 	bot        *bot.Bot
 	store      Store
 	moderation *moderation.Service
+	spam       SpamDetector
 	logger     *slog.Logger
 }
 
-func New(token string, store Store, logger *slog.Logger) (*App, error) {
-	a := &App{store: store, logger: logger}
+func New(token string, store Store, spamDetector SpamDetector, logger *slog.Logger) (*App, error) {
+	a := &App{store: store, spam: spamDetector, logger: logger}
 	a.moderation = moderation.New(store, a, logger)
 	b, err := bot.New(token,
 		bot.WithDefaultHandler(a.handleUpdate),
@@ -38,7 +47,7 @@ func New(token string, store Store, logger *slog.Logger) (*App, error) {
 		bot.WithAllowedUpdates(bot.AllowedUpdates{
 			models.AllowedUpdateMessage,
 			models.AllowedUpdateMessageReaction,
-			models.AllowedUpdateMessageReactionCount,
+			models.AllowedUpdateChatMember,
 			models.AllowedUpdateMyChatMember,
 		}),
 		bot.WithErrorsHandler(func(err error) { logger.Error("telegram polling", "error", err) }),
@@ -62,18 +71,33 @@ func (a *App) handleUpdate(ctx context.Context, _ *bot.Bot, update *models.Updat
 	}
 	if update.MessageReaction != nil {
 		r := update.MessageReaction
+		if r.User == nil || r.ActorChat != nil {
+			return
+		}
 		change := core.ReactionChange{
-			UpdateID:  update.ID,
-			ChatID:    r.Chat.ID,
-			MessageID: r.MessageID,
-			Delta:     dislikePresent(r.NewReaction) - dislikePresent(r.OldReaction),
+			UpdateID:   update.ID,
+			ChatID:     r.Chat.ID,
+			MessageID:  r.MessageID,
+			ActorID:    r.User.ID,
+			ActorIsBot: r.User.IsBot,
+			Delta:      dislikePresent(r.NewReaction) - dislikePresent(r.OldReaction),
+		}
+		if change.Delta == 0 || change.ActorIsBot {
+			return
+		}
+		if change.Delta > 0 {
+			if admin, err := a.IsAdministrator(ctx, r.Chat.ID, r.User.ID); err == nil {
+				change.ActorIsAdmin = admin
+			}
 		}
 		a.applyReaction(ctx, change)
 	}
-	if update.MessageReactionCount != nil {
-		r := update.MessageReactionCount
-		count := dislikeCount(r.Reactions)
-		a.applyReaction(ctx, core.ReactionChange{UpdateID: update.ID, ChatID: r.Chat.ID, MessageID: r.MessageID, Exact: &count})
+	if update.ChatMember != nil && isGroup(update.ChatMember.Chat.Type) {
+		if member, ok := memberChange(update.ChatMember); ok {
+			if err := a.store.RecordMember(ctx, member); err != nil {
+				a.logger.Error("record chat member", "chat_id", member.ChatID, "user_id", member.UserID, "error", err)
+			}
+		}
 	}
 	if update.MyChatMember != nil && isGroup(update.MyChatMember.Chat.Type) {
 		member := update.MyChatMember.NewChatMember
@@ -103,10 +127,15 @@ func (a *App) handleMessage(ctx context.Context, message *models.Message) {
 		}
 		return
 	}
-	if message.From != nil && message.SenderChat == nil {
+	if a.checkChannelSpam(ctx, message) {
+		return
+	}
+	trackable := message.From != nil && message.SenderChat == nil
+	if trackable {
 		tracked := core.TrackedMessage{
 			ChatID: message.Chat.ID, MessageID: message.ID,
-			AuthorID: message.From.ID, AuthorName: displayName(message.From),
+			AuthorID: message.From.ID, AuthorName: displayName(message.From), AuthorIsBot: message.From.IsBot,
+			Content: messageContent(message),
 		}
 		if err := a.store.TrackMessage(ctx, tracked); err != nil {
 			a.logger.Error("track message", "chat_id", message.Chat.ID, "message_id", message.ID, "error", err)
@@ -114,7 +143,165 @@ func (a *App) handleMessage(ctx context.Context, message *models.Message) {
 	}
 	if commandName(message.Text) != "" {
 		a.handleCommand(ctx, message)
+		return
 	}
+	if trackable {
+		a.checkSpam(ctx, message)
+	}
+}
+
+type channelSpamMatch struct {
+	channel models.Chat
+	result  spam.ChannelResult
+	ban     bool
+}
+
+func findChannelSpam(message *models.Message) (channelSpamMatch, bool) {
+	if message.IsAutomaticForward || (message.SenderChat != nil && message.SenderChat.ID == message.Chat.ID) {
+		return channelSpamMatch{}, false
+	}
+	if message.SenderChat != nil &&
+		message.SenderChat.Type == models.ChatTypeChannel &&
+		message.SenderChat.ID != message.Chat.ID {
+		result := spam.DetectChannel(message.SenderChat.Title, message.SenderChat.Username)
+		if result.Spam {
+			return channelSpamMatch{channel: *message.SenderChat, result: result, ban: true}, true
+		}
+	}
+
+	if message.ForwardOrigin == nil {
+		return channelSpamMatch{}, false
+	}
+	var channel *models.Chat
+	switch message.ForwardOrigin.Type {
+	case models.MessageOriginTypeChannel:
+		if origin := message.ForwardOrigin.MessageOriginChannel; origin != nil {
+			channel = &origin.Chat
+		}
+	case models.MessageOriginTypeChat:
+		if origin := message.ForwardOrigin.MessageOriginChat; origin != nil && origin.SenderChat.Type == models.ChatTypeChannel {
+			channel = &origin.SenderChat
+		}
+	case models.MessageOriginTypeUser, models.MessageOriginTypeHiddenUser:
+		return channelSpamMatch{}, false
+	}
+	if channel == nil {
+		return channelSpamMatch{}, false
+	}
+	result := spam.DetectChannel(channel.Title, channel.Username)
+	if !result.Spam {
+		return channelSpamMatch{}, false
+	}
+	return channelSpamMatch{channel: *channel, result: result}, true
+}
+
+func (a *App) checkChannelSpam(ctx context.Context, message *models.Message) bool {
+	match, found := findChannelSpam(message)
+	if !found {
+		return false
+	}
+	settings, err := a.store.Settings(ctx, message.Chat.ID)
+	if err != nil {
+		a.logger.Error("read settings for channel spam", "chat_id", message.Chat.ID, "message_id", message.ID, "error", err)
+		return false
+	}
+	if !settings.Enabled {
+		return false
+	}
+
+	if !match.ban {
+		if message.From == nil {
+			return false
+		}
+		admin, err := a.IsAdministrator(ctx, message.Chat.ID, message.From.ID)
+		if err != nil {
+			a.logger.Error("check channel spam forwarder", "chat_id", message.Chat.ID, "message_id", message.ID, "user_id", message.From.ID, "error", err)
+			return false
+		}
+		if admin {
+			return false
+		}
+	}
+
+	if match.ban {
+		if err := a.banSenderChat(ctx, message.Chat.ID, match.channel.ID); err != nil {
+			a.logger.Error("ban spam sender channel", "chat_id", message.Chat.ID, "message_id", message.ID, "sender_chat_id", match.channel.ID, "channel_title", match.channel.Title, "channel_username", match.channel.Username, "keyword", match.result.Keyword, "error", err)
+		}
+	}
+	if err := a.DeleteMessage(ctx, message.Chat.ID, message.ID); err != nil {
+		a.logger.Error("delete channel spam", "chat_id", message.Chat.ID, "message_id", message.ID, "sender_chat_id", match.channel.ID, "channel_title", match.channel.Title, "channel_username", match.channel.Username, "keyword", match.result.Keyword, "ban_sender_chat", match.ban, "error", err)
+		return true
+	}
+	a.logger.Info("channel spam deleted", "chat_id", message.Chat.ID, "message_id", message.ID, "sender_chat_id", match.channel.ID, "channel_title", match.channel.Title, "channel_username", match.channel.Username, "keyword", match.result.Keyword, "ban_sender_chat", match.ban)
+	return true
+}
+
+func (a *App) checkSpam(ctx context.Context, message *models.Message) {
+	if a.spam == nil {
+		return
+	}
+	text := messageContent(message)
+	if text == "" {
+		return
+	}
+
+	settings, err := a.store.Settings(ctx, message.Chat.ID)
+	if err != nil {
+		a.logger.Error("read settings for spam check", "chat_id", message.Chat.ID, "message_id", message.ID, "error", err)
+		return
+	}
+	if !settings.Enabled {
+		return
+	}
+
+	result := a.spam.Detect(text)
+	if !result.Spam {
+		return
+	}
+	admin, err := a.IsAdministrator(ctx, message.Chat.ID, message.From.ID)
+	if err != nil {
+		a.logger.Error("check spam author status", "chat_id", message.Chat.ID, "message_id", message.ID, "user_id", message.From.ID, "error", err)
+		return
+	}
+	if admin {
+		return
+	}
+	if reactionErr := a.setDislike(ctx, message.Chat.ID, message.ID); reactionErr != nil {
+		a.logger.Error("mark spam message", "chat_id", message.Chat.ID, "message_id", message.ID, "user_id", message.From.ID, "spam_score", result.Score, "signals", result.Signals, "error", reactionErr)
+		return
+	}
+	change := core.ReactionChange{ChatID: message.Chat.ID, MessageID: message.ID, ActorID: a.bot.ID(), ActorIsBot: true, Automated: true, Delta: 1}
+	resultVote, err := a.moderation.ApplyReaction(ctx, change)
+	if err != nil {
+		a.logger.Error("count bot spam vote", "chat_id", message.Chat.ID, "message_id", message.ID, "error", err)
+		return
+	}
+	a.logger.Info("spam message marked", "chat_id", message.Chat.ID, "message_id", message.ID, "user_id", message.From.ID, "spam_score", result.Score, "signals", result.Signals, "dislikes", resultVote.Count)
+}
+
+func messageContent(message *models.Message) string {
+	if text := strings.TrimSpace(message.Text); text != "" {
+		return text
+	}
+	return strings.TrimSpace(message.Caption)
+}
+
+func (a *App) setDislike(ctx context.Context, chatID int64, messageID int) error {
+	ok, err := a.bot.SetMessageReaction(ctx, &bot.SetMessageReactionParams{
+		ChatID:    chatID,
+		MessageID: messageID,
+		Reaction: []models.ReactionType{{
+			Type:              models.ReactionTypeTypeEmoji,
+			ReactionTypeEmoji: &models.ReactionTypeEmoji{Emoji: "👎"},
+		}},
+	})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("telegram returned false while setting dislike")
+	}
+	return nil
 }
 
 func (a *App) handleCommand(ctx context.Context, message *models.Message) {
@@ -243,6 +430,17 @@ func (a *App) Ban(ctx context.Context, chatID, userID int64) error {
 	return nil
 }
 
+func (a *App) banSenderChat(ctx context.Context, chatID, senderChatID int64) error {
+	ok, err := a.bot.BanChatSenderChat(ctx, &bot.BanChatSenderChatParams{ChatID: chatID, SenderChatID: senderChatID})
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errors.New("telegram returned false while banning sender chat")
+	}
+	return nil
+}
+
 func (a *App) DeleteMessage(ctx context.Context, chatID int64, messageID int) error {
 	ok, err := a.bot.DeleteMessage(ctx, &bot.DeleteMessageParams{ChatID: chatID, MessageID: messageID})
 	if err != nil {
@@ -259,18 +457,43 @@ func (a *App) DeleteMessage(ctx context.Context, chatID int64, messageID int) er
 }
 
 func (a *App) NotifyBanned(ctx context.Context, job core.ModerationJob) error {
-	text := fmt.Sprintf("Пользователь %s заблокирован бессрочно: сообщение набрало %d 👎.", job.AuthorName, job.Dislikes)
-	_, err := a.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: job.ChatID, Text: text})
+	if job.NotificationUserID == 0 {
+		return nil
+	}
+	text := fmt.Sprintf("Сообщение пользователя %s удалено: оно набрало %d доверенных 👎. Пользователь не заблокирован автоматически.", job.AuthorName, job.Dislikes)
+	if !job.ProtectAuthor {
+		text = fmt.Sprintf("Пользователь %s заблокирован бессрочно: сообщение набрало %d доверенных 👎.", job.AuthorName, job.Dislikes)
+	}
+	_, err := a.bot.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID: job.ChatID,
+		Text:   text,
+		EphemeralMessageParameters: &models.EphemeralMessageParameters{
+			ReceiverUserID: job.NotificationUserID,
+		},
+	})
 	return err
 }
 
 func (a *App) NotifyFailure(ctx context.Context, job core.ModerationJob, cause error) error {
-	text := fmt.Sprintf("Не удалось автоматически заблокировать %s за сообщение с %d 👎. Администратору нужно проверить права бота и выполнить модерацию вручную.", job.AuthorName, job.Dislikes)
+	text := fmt.Sprintf("Не удалось автоматически обработать сообщение %s с %d доверенными 👎. Администратору нужно проверить права бота и выполнить модерацию вручную.", job.AuthorName, job.Dislikes)
+	if job.ProtectAuthor {
+		text = fmt.Sprintf("Сообщение активного участника %s набрало %d доверенных 👎, но бот не смог его удалить. Проверьте права бота.", job.AuthorName, job.Dislikes)
+	}
 	if job.BanDone {
-		text = fmt.Sprintf("Пользователь %s заблокирован за сообщение с %d 👎, но бот не смог завершить удаление сообщения или отправку уведомления. Проверьте права бота.", job.AuthorName, job.Dislikes)
+		text = fmt.Sprintf("Пользователь %s заблокирован за сообщение с %d доверенных 👎, но бот не смог завершить удаление сообщения или отправку уведомления. Проверьте права бота.", job.AuthorName, job.Dislikes)
+		if job.ProtectAuthor {
+			text = fmt.Sprintf("Сообщение активного участника %s удалено за %d доверенных 👎, но бот не смог завершить уведомление. Проверьте права бота.", job.AuthorName, job.Dislikes)
+		}
 	}
 	_, err := a.bot.SendMessage(ctx, &bot.SendMessageParams{ChatID: job.ChatID, Text: text})
 	return err
+}
+
+func (a *App) LearnSpam(sample core.SpamSample) error {
+	if a.spam == nil {
+		return nil
+	}
+	return a.spam.LearnSpam(sample.ChatID, sample.MessageID, sample.Content)
 }
 
 func dislikePresent(reactions []models.ReactionType) int {
@@ -282,13 +505,61 @@ func dislikePresent(reactions []models.ReactionType) int {
 	return 0
 }
 
-func dislikeCount(reactions []models.ReactionCount) int {
-	for _, reaction := range reactions {
-		if dislikePresent([]models.ReactionType{reaction.Type}) == 1 {
-			return reaction.TotalCount
-		}
+func memberChange(update *models.ChatMemberUpdated) (core.MemberChange, bool) {
+	user, active, admin, ok := memberInfo(update.NewChatMember)
+	if !ok || user == nil {
+		return core.MemberChange{}, false
 	}
-	return 0
+	_, wasActive, _, _ := memberInfo(update.OldChatMember)
+	var joinedAt time.Time
+	if active && !wasActive && update.Date > 0 {
+		joinedAt = time.Unix(int64(update.Date), 0)
+	}
+	return core.MemberChange{
+		ChatID:        update.Chat.ID,
+		UserID:        user.ID,
+		IsBot:         user.IsBot,
+		Administrator: admin,
+		Active:        active,
+		JoinedAt:      joinedAt,
+	}, true
+}
+
+func memberInfo(member models.ChatMember) (*models.User, bool, bool, bool) {
+	switch member.Type {
+	case models.ChatMemberTypeOwner:
+		if member.Owner == nil {
+			return nil, false, false, false
+		}
+		return member.Owner.User, true, true, member.Owner.User != nil
+	case models.ChatMemberTypeAdministrator:
+		if member.Administrator == nil {
+			return nil, false, false, false
+		}
+		return &member.Administrator.User, true, true, true
+	case models.ChatMemberTypeMember:
+		if member.Member == nil {
+			return nil, false, false, false
+		}
+		return member.Member.User, true, false, member.Member.User != nil
+	case models.ChatMemberTypeRestricted:
+		if member.Restricted == nil {
+			return nil, false, false, false
+		}
+		return member.Restricted.User, member.Restricted.IsMember, false, member.Restricted.User != nil
+	case models.ChatMemberTypeLeft:
+		if member.Left == nil {
+			return nil, false, false, false
+		}
+		return member.Left.User, false, false, member.Left.User != nil
+	case models.ChatMemberTypeBanned:
+		if member.Banned == nil {
+			return nil, false, false, false
+		}
+		return member.Banned.User, false, false, member.Banned.User != nil
+	default:
+		return nil, false, false, false
+	}
 }
 
 func displayName(user *models.User) string {
@@ -333,7 +604,7 @@ func rightsProblem(rights core.BotRights) string {
 	return "Автомодерация не включена: нужно " + strings.Join(missing, ", ") + "."
 }
 
-const helpText = `Бот блокирует автора сообщения, когда сообщение набирает заданное количество 👎.
+const helpText = `Бот блокирует автора сообщения, когда сообщение набирает заданное количество доверенных 👎. Для активных давних участников порог удваивается, а сообщение удаляется без автоматической блокировки. Каналы с VPN/ВПН/PROXY/ПРОКСИ в названии блокируются автоматически.
 
 Команды администратора:
 /status — состояние и текущий порог

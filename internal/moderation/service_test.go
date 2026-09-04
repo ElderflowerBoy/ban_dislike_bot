@@ -14,12 +14,17 @@ import (
 type fakeStore struct {
 	jobs       []core.ModerationJob
 	steps      []string
+	samples    []core.SpamSample
 	finalState string
 	retries    int
 }
 
 func (s *fakeStore) ApplyReaction(context.Context, core.ReactionChange) (core.ApplyResult, error) {
 	return core.ApplyResult{}, nil
+}
+func (s *fakeStore) RecordSpamSample(_ context.Context, sample core.SpamSample) error {
+	s.samples = append(s.samples, sample)
+	return nil
 }
 func (s *fakeStore) DueJobs(context.Context, int) ([]core.ModerationJob, error) {
 	return s.jobs, nil
@@ -50,6 +55,7 @@ type fakeTelegram struct {
 	deletes       int
 	notifications int
 	failures      int
+	learned       []core.SpamSample
 }
 
 func (t *fakeTelegram) IsAdministrator(context.Context, int64, int64) (bool, error) {
@@ -69,6 +75,10 @@ func (t *fakeTelegram) NotifyBanned(context.Context, core.ModerationJob) error {
 }
 func (t *fakeTelegram) NotifyFailure(context.Context, core.ModerationJob, error) error {
 	t.failures++
+	return nil
+}
+func (t *fakeTelegram) LearnSpam(sample core.SpamSample) error {
+	t.learned = append(t.learned, sample)
 	return nil
 }
 
@@ -96,6 +106,23 @@ func TestProcessJobCompletesAllSteps(t *testing.T) {
 	}
 }
 
+func TestProcessJobLearnsFromBannedMessage(t *testing.T) {
+	store := &fakeStore{}
+	telegram := &fakeTelegram{}
+	service := New(store, telegram, testLogger())
+	job := core.ModerationJob{ChatID: -1, MessageID: 2, AuthorID: 3, Content: "spam text"}
+
+	if err := service.processJob(context.Background(), job); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.samples) != 1 || store.samples[0].Content != job.Content {
+		t.Fatalf("persisted samples = %+v", store.samples)
+	}
+	if len(telegram.learned) != 1 || telegram.learned[0] != store.samples[0] {
+		t.Fatalf("cached samples = %+v", telegram.learned)
+	}
+}
+
 func TestProcessJobProtectsAdministrator(t *testing.T) {
 	store := &fakeStore{}
 	telegram := &fakeTelegram{admin: true}
@@ -109,6 +136,28 @@ func TestProcessJobProtectsAdministrator(t *testing.T) {
 	}
 	if store.finalState != "exempt" {
 		t.Fatalf("final state = %q", store.finalState)
+	}
+}
+
+func TestProcessJobProtectsActiveAuthor(t *testing.T) {
+	store := &fakeStore{}
+	telegram := &fakeTelegram{}
+	service := New(store, telegram, testLogger())
+
+	if err := service.processJob(context.Background(), core.ModerationJob{ChatID: -1, MessageID: 2, AuthorID: 3, Content: "disliked but not banned", ProtectAuthor: true}); err != nil {
+		t.Fatal(err)
+	}
+	if telegram.bans != 0 || telegram.deletes != 1 || telegram.notifications != 1 {
+		t.Fatalf("unexpected protected author calls: %+v", telegram)
+	}
+	if len(store.steps) != 3 || store.steps[0] != "ban" || store.steps[1] != "delete" || store.steps[2] != "notify" {
+		t.Fatalf("unexpected persisted steps: %v", store.steps)
+	}
+	if store.finalState != "completed" {
+		t.Fatalf("final state = %q", store.finalState)
+	}
+	if len(store.samples) != 0 || len(telegram.learned) != 0 {
+		t.Fatal("protected author message was used as a confirmed spam sample")
 	}
 }
 
